@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.Rendering.RenderGraphModule;
 using System.Collections.Generic;
 using UnityEngine.Experimental.Rendering;
 
@@ -12,6 +13,7 @@ namespace BlendedBuffer
     public class BlendedBufferFeature : ScriptableRendererFeature
     {
         const string RENDER_TARGET_NAME = "_BlendedTarget";
+        const string RENDER_TARGET_DEPTH_NAME = "_BlendedTarget_Depth";
         
         public enum DOWN_SAMPLING
         {
@@ -26,12 +28,16 @@ namespace BlendedBuffer
         {
             public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingSkybox;
             public DOWN_SAMPLING downSampling = DOWN_SAMPLING.X2; // to divide resolution
-            public LayerMask layerMask = 0; // layer for VFX 
+            public LayerMask layerMask = 0; // layer for VFX
+            [Tooltip("BilinearだとDepthとのEdgeは綺麗になりますが全体的にボケが強くなるのでお好みで選択ください")]
+            public FilterMode downSampleFilterMode = FilterMode.Bilinear;
+            
+            [HideInInspector] public Shader copyDepthShader = null;
+            [HideInInspector] public Shader blitShader = null;
         }
 
         [SerializeField] Settings settings = new Settings();
         BlendedBufferPass blendedBufferPass;
-        RTHandle colorRTHandle, depthRTHandle;
 
         class BlendedBufferPass : ScriptableRenderPass
         {
@@ -41,111 +47,34 @@ namespace BlendedBuffer
                 //new ShaderTagId("UniversalForward"),
             };
 
-            RTHandle colorRT, depthRT;
+            class PassData
+            {
+                public TextureHandle color, depth, srcColor, srcDepth;
+                public RendererListHandle rendererListHandle;
+            }
+
             Material copyDepth, blitMaterial;
-            readonly FilteringSettings filteringSettings;
+            FilteringSettings filteringSettings;
+            int downSampling = 1;
+            FilterMode filterMode = FilterMode.Bilinear;
 
             public BlendedBufferPass(Settings settings)
             {
-                this.profilingSampler = new ProfilingSampler(nameof(BlendedBufferPass));
                 this.renderPassEvent = settings.renderPassEvent;
                 this.filteringSettings = new FilteringSettings(RenderQueueRange.transparent, settings.layerMask);
+                this.downSampling = (int)settings.downSampling;
                 
-                //var copyDepthShader = Shader.Find("Hidden/Universal Render Pipeline/CopyDepth");
-                var copyDepthShader = Shader.Find("BlendedBuffer/CopyDepth");
-                if (copyDepthShader != null)
-                    this.copyDepth = new Material(copyDepthShader);
+#if UNITY_EDITOR
+                if (settings.copyDepthShader == null)
+                    settings.copyDepthShader = Shader.Find("BlendedBuffer/CopyDepth");
+                if (settings.blitShader == null)
+                    settings.blitShader = Shader.Find("BlendedBuffer/Premultiply Blit");
                 
-                //var blitShader = Shader.Find("Hidden/Universal Render Pipeline/Blit");
-                var blitShader = Shader.Find("BlendedBuffer/Premultiply Blit");
-                if (blitShader != null)
-                    this.blitMaterial = new Material(blitShader);
-
-                // No need?
-                this.ResetTarget();
-            }
-
-            // Called at SetupRenderPasses
-            public void Setup(RTHandle colorRT, RTHandle depthRT)
-            {
-                this.colorRT = colorRT;
-                this.depthRT = depthRT;
-            }
-
-            public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData)
-            {
-                var isGameCamera = renderingData.cameraData.cameraType == CameraType.Game;
-                var cmd = CommandBufferPool.Get();
-                using (new ProfilingScope(cmd, this.profilingSampler))
-                {
-                    if (isGameCamera)
-                    {
-                        cmd.SetRenderTarget(this.colorRT, this.depthRT);
-                        cmd.ClearRenderTarget(true, true, Color.clear);
-
-                        // Blit DepthBuffer -> BlendedBuffer
-                        // NOTE: for preset CopyDepth shader 
-                        // if (this.depthRT.rt.graphicsFormat == GraphicsFormat.None)
-                        //     cmd.EnableShaderKeyword("_OUTPUT_DEPTH");
-                        // else
-                        //     cmd.DisableShaderKeyword("_OUTPUT_DEPTH");
-                        var targetDepthRTHandle = renderingData.cameraData.renderer.cameraDepthTargetHandle;
-                        var scaleBias = new Vector4(1f, 1f, 0f, 0f);
-                        Blitter.BlitTexture(cmd, targetDepthRTHandle, scaleBias, this.copyDepth, 0);
-                    }
-                    else
-                    {
-                        // other cameras do not need to use BlendedBuffer(SceneView, Preview, etc...)
-                        cmd.SetRenderTarget(renderingData.cameraData.renderer.cameraColorTargetHandle,
-                                            renderingData.cameraData.renderer.cameraDepthTargetHandle);
-                    }
-                    
-                    // Rendering by LayerMask(e.g. any VFX)
-                    var drawSettings =
-                        CreateDrawingSettings(SHADER_TAG_ID, ref renderingData, SortingCriteria.CommonTransparent);
-                    drawSettings.perObjectData = PerObjectData.None;
-
-                    // NOTE:
-                    // 近景・遠景のVFXでLayerを分けて遠景の画面占有率が低いVFXに関しては直接バッファに書き込むアプローチもあるらしい
-                    // https://game.watch.impress.co.jp/docs/20081203/3dmg4.htm
-#if true
-                    var param = new RendererListParams(renderingData.cullResults, drawSettings, this.filteringSettings);
-                    var rl = context.CreateRendererList(ref param);
-                    cmd.DrawRendererList(rl);
-#else
-                    context.ExecuteCommandBuffer(cmd);
-                    cmd.Clear();
-                    // NOTE: DrawRenderers式なら先にExecuteCommandBufferしないといけない
-                    context.DrawRenderers(renderingData.cullResults, ref drawSettings, ref filteringSettings);
+                Debug.Assert(settings.copyDepthShader != null, "Copy Depth Shader is not found.");
+                Debug.Assert(settings.blitShader != null, "Blit Shader is not found.");
 #endif
-
-                    if (isGameCamera)
-                    {
-                        // Blit BlendedBuffer -> CameraColorAttachment
-                        // Blitter.BlitCameraTexture(cmd,
-                        //                           this.colorRT, renderingData.cameraData.renderer.cameraColorTargetHandle,
-                        //                           RenderBufferLoadAction.DontCare, RenderBufferStoreAction.Store,
-                        //                           this.blitMaterial, 0);
-                        var dstColorRT = renderingData.cameraData.renderer.cameraColorTargetHandle;
-                        //var dstDepthRT = renderingData.cameraData.renderer.cameraDepthTargetHandle;
-                        //var viewportScale = this.colorRT.useScaling ? new Vector2(this.colorRT.rtHandleProperties.rtHandleScale.x, this.colorRT.rtHandleProperties.rtHandleScale.y) : Vector2.one;
-                        //cmd.SetRenderTarget(dstColorRT, dstDepthRT);
-                        var viewportScale = Vector2.one;
-                        cmd.SetRenderTarget(dstColorRT);
-                        Blitter.BlitTexture(cmd, this.colorRT, viewportScale, this.blitMaterial, 0);
-                    }
-                }
-
-                context.ExecuteCommandBuffer(cmd);
-                CommandBufferPool.Release(cmd);
-            }
-
-            public override void OnCameraCleanup(CommandBuffer cmd)
-            {
-                if (cmd == null)
-                    throw new System.ArgumentNullException("cmd");
-                this.colorRT = null;
-                this.depthRT = null;
+                this.copyDepth = new Material(settings.copyDepthShader);
+                this.blitMaterial = new Material(settings.blitShader);
             }
 
             public void Dispose()
@@ -154,51 +83,118 @@ namespace BlendedBuffer
                 CoreUtils.Destroy(this.blitMaterial);
                 this.copyDepth = this.blitMaterial = null;
             }
+            
+#if UNITY_EDITOR
+            public void UpdateSettings(Settings settings)
+            {
+                this.renderPassEvent = settings.renderPassEvent;
+                this.filteringSettings.layerMask = settings.layerMask;
+                this.downSampling = (int)settings.downSampling;
+                this.filterMode = settings.downSampleFilterMode;
+            }
+#endif
+
+            public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
+            {
+                var resourceData = frameData.Get<UniversalResourceData>();
+                var cameraData = frameData.Get<UniversalCameraData>();
+                var renderingData = frameData.Get<UniversalRenderingData>();
+                var lightData = frameData.Get<UniversalLightData>();
+                
+                var isGameCamera = cameraData.cameraType == CameraType.Game;
+                var colorTarget = resourceData.activeColorTexture;
+                var depthTarget = resourceData.activeDepthTexture;
+                if (isGameCamera)
+                {
+                    var downDesc = renderGraph.GetTextureDesc(resourceData.activeColorTexture);
+                    var width = downDesc.width / this.downSampling;
+                    var height = downDesc.height / this.downSampling;
+                    downDesc.width = width;
+                    downDesc.height = height;
+                    downDesc.format = GraphicsFormat.R16G16B16A16_SFloat;
+                    downDesc.filterMode = this.filterMode;
+                    downDesc.name = RENDER_TARGET_NAME;
+                    colorTarget = renderGraph.CreateTexture(downDesc);
+                    downDesc.format = GraphicsFormat.D24_UNorm;
+                    downDesc.msaaSamples = MSAASamples.None;
+                    downDesc.name = RENDER_TARGET_DEPTH_NAME;
+                    depthTarget = renderGraph.CreateTexture(downDesc);
+                }
+
+                var drawSettings = RenderingUtils.CreateDrawingSettings(SHADER_TAG_ID, renderingData, cameraData, lightData, SortingCriteria.CommonTransparent);
+                drawSettings.perObjectData = PerObjectData.None;
+                var renderListParam = new RendererListParams(renderingData.cullResults, drawSettings, this.filteringSettings);
+                var rendererListHandle = renderGraph.CreateRendererList(renderListParam);
+                
+                // NOTE:
+                // 近景・遠景のVFXでLayerを分けて遠景の画面占有率が低いVFXに関しては直接バッファに書き込むアプローチもあるらしい
+                // https://game.watch.impress.co.jp/docs/20081203/3dmg4.htm
+                using(var builder = renderGraph.AddUnsafePass("Draw Downsampled Buffer", out PassData passData))
+                {
+                    passData.srcColor = resourceData.activeColorTexture;
+                    passData.srcDepth = resourceData.activeDepthTexture;
+                    passData.color = colorTarget;
+                    passData.depth = depthTarget;
+                    passData.rendererListHandle = rendererListHandle;
+                    builder.UseRendererList(rendererListHandle);
+                    builder.AllowPassCulling(false);
+                    if (isGameCamera)
+                    {
+                        builder.UseTexture(in colorTarget, AccessFlags.Write);
+                        builder.UseTexture(in depthTarget, AccessFlags.Write);
+                        builder.SetRenderFunc((PassData data, UnsafeGraphContext context) =>
+                        {
+                            var cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
+                            var scaleBias = new Vector4(1f, 1f, 0f, 0f);
+                            
+                            // Ready for downsampled buffer
+                            cmd.SetRenderTarget(data.color, data.depth);
+                            cmd.ClearRenderTarget(RTClearFlags.All, Color.clear, 1, 0);
+                            Blitter.BlitTexture(cmd, data.srcDepth, scaleBias, this.copyDepth, 0);
+
+                            // Transparent
+                            cmd.DrawRendererList(data.rendererListHandle);
+                            
+                            // Combine
+                            cmd.SetRenderTarget(data.srcColor);
+                            Blitter.BlitTexture(cmd, data.color, scaleBias, this.blitMaterial, 0);
+                        });
+                    }
+                    else
+                    {
+                        builder.SetRenderFunc((PassData data, UnsafeGraphContext context) =>
+                        {
+                            var cmd = context.cmd;
+                            cmd.SetRenderTarget(data.color, data.depth);
+                            cmd.DrawRendererList(data.rendererListHandle);
+                        });
+                    }
+                }
+            }
         }
 
         public override void Create()
         {
             this.name = "BlendedBuffer";
-            if (this.blendedBufferPass == null)
-                this.blendedBufferPass = new BlendedBufferPass(this.settings);
+            this.blendedBufferPass ??= new BlendedBufferPass(this.settings);
         }
 
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
+#if UNITY_EDITOR
+            this.blendedBufferPass.UpdateSettings(this.settings);
+#endif
             renderer.EnqueuePass(this.blendedBufferPass);
         }
 
-        public override void SetupRenderPasses(ScriptableRenderer renderer, in RenderingData renderingData)
-        {
-            var desc = renderingData.cameraData.cameraTargetDescriptor;
-            // Create RTHandle with RenderingUtils.ReAllocateIfNeeded
-            var downSampling = (int)this.settings.downSampling;
-            desc.width = desc.width / downSampling;
-            desc.height = desc.height / downSampling;
-            desc.graphicsFormat = GraphicsFormat.R16G16B16A16_SFloat;
-            
-            var depthDesc = desc;
-            depthDesc.msaaSamples = 1;// Depth-Only pass don't use MSAA
-            depthDesc.graphicsFormat = GraphicsFormat.None; // DepthBufferとしてColorBufferにBindさせるにはR32ではダメ
-            RenderingUtils.ReAllocateIfNeeded(ref this.depthRTHandle, depthDesc, FilterMode.Point,
-                                              TextureWrapMode.Clamp, false, 1, 0, RENDER_TARGET_NAME);
-            // must set 0 to use as DepthBuffer
-            // automatically set stencilFormat when set depthBufferBits
-            desc.depthBufferBits = 0;
-            RenderingUtils.ReAllocateIfNeeded(ref this.colorRTHandle, desc, FilterMode.Point, // BilinearだとDepthとのEdgeは綺麗だが全体的にボケが強い
-                                              TextureWrapMode.Clamp, false, 1, 0, RENDER_TARGET_NAME);
-
-            this.blendedBufferPass.Setup(this.colorRTHandle, this.depthRTHandle);
-        }
+        // public override void SetupRenderPasses(ScriptableRenderer renderer, in RenderingData renderingData)
+        // {
+        // }
 
         protected override void Dispose(bool disposing)
         {
-            this.blendedBufferPass.Dispose();
+            this.blendedBufferPass?.Dispose();
             this.blendedBufferPass = null;
-            
-            this.colorRTHandle?.Release();
-            this.depthRTHandle?.Release();
-            this.colorRTHandle = this.depthRTHandle = null;
         }
     }
 }
