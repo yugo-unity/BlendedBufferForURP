@@ -14,9 +14,10 @@ namespace BlendedBuffer
     {
         const string RENDER_TARGET_NAME = "_BlendedTarget";
         const string RENDER_TARGET_DEPTH_NAME = "_BlendedTarget_Depth";
-        
+
         public enum DOWN_SAMPLING
         {
+            NONE = 1,
             X2 = 2,
             X4 = 4,
             X8 = 8,
@@ -29,11 +30,14 @@ namespace BlendedBuffer
             public RenderPassEvent renderPassEvent = RenderPassEvent.AfterRenderingSkybox;
             public DOWN_SAMPLING downSampling = DOWN_SAMPLING.X2; // to divide resolution
             public LayerMask layerMask = 0; // layer for VFX
+
             [Tooltip("BilinearだとDepthとのEdgeは綺麗になりますが全体的にボケが強くなるのでお好みで選択ください")]
             public FilterMode downSampleFilterMode = FilterMode.Bilinear;
-            
+
             [HideInInspector] public Shader copyDepthShader = null;
             [HideInInspector] public Shader blitShader = null;
+
+            public bool enabledMRT = true;
         }
 
         [SerializeField] Settings settings = new Settings();
@@ -47,34 +51,46 @@ namespace BlendedBuffer
                 //new ShaderTagId("UniversalForward"),
             };
 
+            static readonly int ALPHA_TEX_ID = Shader.PropertyToID("_AlphaTex");
+
             class PassData
             {
-                public TextureHandle color, depth, srcColor, srcDepth;
+                public TextureHandle color, alpha, depth, srcColor, srcDepth;
                 public RendererListHandle rendererListHandle;
+                public bool enabledMRT;
+                public Material copyDepth, blitMaterial;
             }
 
             Material copyDepth, blitMaterial;
             FilteringSettings filteringSettings;
-            int downSampling = 1;
-            FilterMode filterMode = FilterMode.Bilinear;
+            Settings settings;
+            static readonly RenderTargetIdentifier[] mrtTargets = new RenderTargetIdentifier[2];
+            static readonly Color[] MRT_CLEAR_COLORS = new Color[2] { Color.black, Color.red };
+            static readonly Vector4 SCALE_BIAS = new Vector4(1f, 1f, 0f, 0f);
 
+            public void UpdateSettings(Settings settings)
+            {
+                this.settings = settings;
+                this.renderPassEvent = settings.renderPassEvent;
+                this.filteringSettings.layerMask= settings.layerMask;
+            }
+            
             public BlendedBufferPass(Settings settings)
             {
-                this.renderPassEvent = settings.renderPassEvent;
-                this.filteringSettings = new FilteringSettings(RenderQueueRange.transparent, settings.layerMask);
-                this.downSampling = (int)settings.downSampling;
-                
+                this.filteringSettings = new FilteringSettings(RenderQueueRange.transparent);
+                this.UpdateSettings(settings);
+
 #if UNITY_EDITOR
                 if (settings.copyDepthShader == null)
                     settings.copyDepthShader = Shader.Find("BlendedBuffer/CopyDepth");
                 if (settings.blitShader == null)
                     settings.blitShader = Shader.Find("BlendedBuffer/Premultiply Blit");
-                
+
                 Debug.Assert(settings.copyDepthShader != null, "Copy Depth Shader is not found.");
                 Debug.Assert(settings.blitShader != null, "Blit Shader is not found.");
 #endif
-                this.copyDepth = new Material(settings.copyDepthShader);
-                this.blitMaterial = new Material(settings.blitShader);
+                this.copyDepth = CoreUtils.CreateEngineMaterial(settings.copyDepthShader);
+                this.blitMaterial = CoreUtils.CreateEngineMaterial(settings.blitShader);
             }
 
             public void Dispose()
@@ -83,16 +99,6 @@ namespace BlendedBuffer
                 CoreUtils.Destroy(this.blitMaterial);
                 this.copyDepth = this.blitMaterial = null;
             }
-            
-#if UNITY_EDITOR
-            public void UpdateSettings(Settings settings)
-            {
-                this.renderPassEvent = settings.renderPassEvent;
-                this.filteringSettings.layerMask = settings.layerMask;
-                this.downSampling = (int)settings.downSampling;
-                this.filterMode = settings.downSampleFilterMode;
-            }
-#endif
 
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
             {
@@ -100,64 +106,90 @@ namespace BlendedBuffer
                 var cameraData = frameData.Get<UniversalCameraData>();
                 var renderingData = frameData.Get<UniversalRenderingData>();
                 var lightData = frameData.Get<UniversalLightData>();
-                
+
                 var isGameCamera = cameraData.cameraType == CameraType.Game;
                 var colorTarget = resourceData.activeColorTexture;
                 var depthTarget = resourceData.activeDepthTexture;
+                var alphaTarget = colorTarget;
                 if (isGameCamera)
                 {
-                    var downDesc = renderGraph.GetTextureDesc(resourceData.activeColorTexture);
-                    var width = downDesc.width / this.downSampling;
-                    var height = downDesc.height / this.downSampling;
-                    downDesc.width = width;
-                    downDesc.height = height;
-                    downDesc.format = GraphicsFormat.R16G16B16A16_SFloat;
-                    downDesc.filterMode = this.filterMode;
-                    downDesc.name = RENDER_TARGET_NAME;
-                    colorTarget = renderGraph.CreateTexture(downDesc);
-                    downDesc.format = GraphicsFormat.D24_UNorm;
-                    downDesc.msaaSamples = MSAASamples.None;
-                    downDesc.name = RENDER_TARGET_DEPTH_NAME;
-                    depthTarget = renderGraph.CreateTexture(downDesc);
+                    // TODO: 自前のRTHandle作った方が良さげ
+                    var desc = renderGraph.GetTextureDesc(resourceData.activeColorTexture);
+                    var downSampling = (int)this.settings.downSampling;
+                    var width = desc.width / downSampling;
+                    var height = desc.height / downSampling;
+                    desc.width = width;
+                    desc.height = height;
+                    if (this.settings.enabledMRT)
+                        desc.format = GraphicsFormat.B10G11R11_UFloatPack32;
+                    else
+                        desc.format = GraphicsFormat.R16G16B16A16_SFloat;
+                    desc.filterMode = this.settings.downSampleFilterMode;
+                    desc.name = RENDER_TARGET_NAME;
+                    colorTarget = renderGraph.CreateTexture(desc);
+                    desc.format = GraphicsFormat.R8_SNorm;
+                    alphaTarget = renderGraph.CreateTexture(desc);
+                    desc.format = GraphicsFormat.D24_UNorm_S8_UInt;
+                    desc.msaaSamples = MSAASamples.None;
+                    desc.name = RENDER_TARGET_DEPTH_NAME;
+                    depthTarget = renderGraph.CreateTexture(desc);
                 }
 
                 var drawSettings = RenderingUtils.CreateDrawingSettings(SHADER_TAG_ID, renderingData, cameraData, lightData, SortingCriteria.CommonTransparent);
                 drawSettings.perObjectData = PerObjectData.None;
                 var renderListParam = new RendererListParams(renderingData.cullResults, drawSettings, this.filteringSettings);
                 var rendererListHandle = renderGraph.CreateRendererList(renderListParam);
-                
+
                 // NOTE:
                 // 近景・遠景のVFXでLayerを分けて遠景の画面占有率が低いVFXに関しては直接バッファに書き込むアプローチもあるらしい
                 // https://game.watch.impress.co.jp/docs/20081203/3dmg4.htm
-                using(var builder = renderGraph.AddUnsafePass("Draw Downsampled Buffer", out PassData passData))
+                using (var builder = renderGraph.AddUnsafePass("Draw Downsampled Buffer", out PassData passData))
                 {
+                    passData.enabledMRT = this.settings.enabledMRT;
                     passData.srcColor = resourceData.activeColorTexture;
                     passData.srcDepth = resourceData.activeDepthTexture;
                     passData.color = colorTarget;
+                    passData.alpha = alphaTarget;
                     passData.depth = depthTarget;
                     passData.rendererListHandle = rendererListHandle;
+                    passData.copyDepth = this.copyDepth;
+                    passData.blitMaterial = this.blitMaterial;
                     builder.UseRendererList(rendererListHandle);
                     builder.AllowPassCulling(false);
                     if (isGameCamera)
                     {
                         builder.UseTexture(in colorTarget, AccessFlags.Write);
+                        if (this.settings.enabledMRT)
+                            builder.UseTexture(in alphaTarget, AccessFlags.Write);
                         builder.UseTexture(in depthTarget, AccessFlags.Write);
                         builder.SetRenderFunc((PassData data, UnsafeGraphContext context) =>
                         {
                             var cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
-                            var scaleBias = new Vector4(1f, 1f, 0f, 0f);
-                            
+
                             // Ready for downsampled buffer
-                            cmd.SetRenderTarget(data.color, data.depth);
-                            cmd.ClearRenderTarget(RTClearFlags.All, Color.clear, 1, 0);
-                            Blitter.BlitTexture(cmd, data.srcDepth, scaleBias, this.copyDepth, 0);
+                            if (data.enabledMRT)
+                            {
+                                data.blitMaterial.EnableKeyword("MRT");
+                                data.blitMaterial.SetTexture(ALPHA_TEX_ID, alphaTarget);
+                                mrtTargets[0] = data.color;
+                                mrtTargets[1] = data.alpha;
+                                cmd.SetRenderTarget(mrtTargets, data.depth);
+                            }
+                            else
+                            {
+                                data.blitMaterial.DisableKeyword("MRT");
+                                data.blitMaterial.SetTexture(ALPHA_TEX_ID, null);
+                                cmd.SetRenderTarget(data.color, data.depth);
+                            }
+                            cmd.ClearRenderTarget(RTClearFlags.All, MRT_CLEAR_COLORS, 1, 0);
+                            Blitter.BlitTexture(cmd, data.srcDepth, SCALE_BIAS, data.copyDepth, 0);
 
                             // Transparent
                             cmd.DrawRendererList(data.rendererListHandle);
-                            
+
                             // Combine
                             cmd.SetRenderTarget(data.srcColor);
-                            Blitter.BlitTexture(cmd, data.color, scaleBias, this.blitMaterial, 0);
+                            Blitter.BlitTexture(cmd, data.color, SCALE_BIAS, data.blitMaterial, 0);
                         });
                     }
                     else

@@ -18,7 +18,7 @@ Shader "BlendedBuffer/Premultiply Blit"
         {
             Name "Blit Shrink"
             //Blend [_SrcFactor] [_DstFactor]
-            Blend One OneMinusSrcAlpha
+            Blend One SrcAlpha
             ZTest Always
             ZWrite Off
             Cull Off
@@ -34,6 +34,7 @@ Shader "BlendedBuffer/Premultiply Blit"
             #pragma fragment Fragment
             //#pragma multi_compile_fragment _ _LINEAR_TO_SRGB_CONVERSION // no need?
             #pragma multi_compile_fragment _ DEBUG_DISPLAY
+            #pragma multi_compile_fragment _ MRT
 
             // Core.hlsl for XR dependencies
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
@@ -42,28 +43,30 @@ Shader "BlendedBuffer/Premultiply Blit"
             #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Color.hlsl"
 
             SAMPLER(sampler_BlitTexture);
+			TEXTURE2D_X(_AlphaTex);
 
             half4 Fragment(Varyings input) : SV_Target
             {
                 float2 uv = input.texcoord;
 
                 half4 col = SAMPLE_TEXTURE2D_X(_BlitTexture, sampler_BlitTexture, uv);
-
-                //clip(col.a - 0.001); // TODO: confirm performance
+                #ifdef MRT
+				col.a = SAMPLE_TEXTURE2D_X(_AlphaTex, sampler_BlitTexture, uv).r;
+                #endif
 
                 #ifdef _LINEAR_TO_SRGB_CONVERSION
                 col = LinearToSRGB(col);
                 #endif
-
+                
                 #if defined(DEBUG_DISPLAY)
                 half4 debugColor = 0;
-
+                
                 if(CanDebugOverrideOutputColor(col, uv, debugColor))
                 {
                     return debugColor;
                 }
                 #endif
-
+                
                 return col;
             }
             ENDHLSL

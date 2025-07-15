@@ -76,3 +76,4 @@ MonoBehaviour:
     downSampleFilterMode: 1
     copyDepthShader: {fileID: 4800000, guid: 0b7744d3a18c0cd4b87db4ff022c2f7b, type: 3}
     blitShader: {fileID: 4800000, guid: b5270fa7172bf3b49872d2137750c08c, type: 3}
+    enabledMRT: 0

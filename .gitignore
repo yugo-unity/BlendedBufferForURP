@@ -64,3 +64,5 @@ crashlytics-build.properties
 
 # UserSettings for Unity
 UserSettings/
+*_ButDontShip*
+*_DoNotShip*
